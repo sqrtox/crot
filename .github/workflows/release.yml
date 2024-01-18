@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+
+jobs:
+  crate_metadata:
+    name: Extract crate metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Extract crate information
+        id: crate_metadata
+        run: |
+          metadata=`cargo metadata --no-deps --format-version 1`
+          echo $metadata | jq -r '"name=" + .packages[0].name' | tee -a $GITHUB_OUTPUT
+          echo $metadata | jq -r '"version=" + .packages[0].version' | tee -a $GITHUB_OUTPUT
+    outputs:
+      name: ${{ steps.crate_metadata.outputs.name }}
+      version: ${{ steps.crate_metadata.outputs.version }}
+
+  build:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    needs: crate_metadata
+    steps:
+      - name: Setup code
+        uses: actions/checkout@v3
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt install -qq -y musl-tools --no-install-recommends
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup component add clippy
+          rustup component add rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy -- -D warnings
+      - uses: Swatinem/rust-cache@v2
+
+      - if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: test
+        run: cargo test
+
+      - name: Build
+        run: |
+          cargo build --release --target=${{ matrix.target }}
+
+      - name: Package for linux-musl
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          strip target/${{ matrix.target }}/release/${{ needs.crate_metadata.outputs.name }}
+          zip --junk-paths ${{ needs.crate_metadata.outputs.name }}-${{ matrix.target }} target/${{ matrix.target }}/release/${{ needs.crate_metadata.outputs.name }}
+
+      - name: Package for windows
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        run: |
+          powershell Compress-Archive -Path target/${{ matrix.target }}/release/${{ needs.crate_metadata.outputs.name }}.exe -DestinationPath ${{ needs.crate_metadata.outputs.name }}-${{ matrix.target }}.zip
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: build-${{ matrix.target }}
+          path: ${{ needs.crate_metadata.outputs.name }}-${{ matrix.target }}.zip
+
+  create_release:
+    needs:
+      - crate_metadata
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          tag_name: ${{ github.ref }}
+          name: v${{ needs.crate_metadata.outputs.version }}
+          draft: false
+          prerelease: false
+      - run: |
+          echo '${{ steps.create_release.outputs.upload_url }}' > release_upload_url.txt
+      - uses: actions/upload-artifact@v1
+        with:
+          name: create_release
+          path: release_upload_url.txt
+
+  upload_release:
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - x86_64-pc-windows-msvc
+    needs:
+      - create_release
+      - crate_metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v1
+        with:
+          name: create_release
+      - id: upload_url
+        run: |
+          echo "url=$(cat create_release/release_upload_url.txt)" >> $GITHUB_OUTPUT
+      - uses: actions/download-artifact@v1
+        with:
+          name: build-${{ matrix.target }}
+      - uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.upload_url.outputs.url }}
+          asset_path: ./build-${{ matrix.target }}/${{ needs.crate_metadata.outputs.name }}-${{ matrix.target }}.zip
+          asset_name: ${{ needs.crate_metadata.outputs.name }}-v${{ needs.crate_metadata.outputs.version }}-${{ matrix.target }}.zip
+          asset_content_type: application/zip
